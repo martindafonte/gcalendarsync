@@ -6,9 +6,13 @@
 // Set this value to match your calendar!!!
 // Calendar ID can be found in the "Calendar Address" section of the Calendar Settings.
 var calendarId = '<your-calendar-id>@group.calendar.google.com';
-//Configure the year range you want to syncrhonize, e.g.: [2006, 2017]
-var years = [];
 
+// Set the beginning and end dates that should be synced. beginDate can be set to Date() to use
+// today. The numbers are year, month, date, where month is 0 for Jan through 11 for Dec.
+var beginDate = new Date(1970, 0, 1);  // Default to Jan 1, 1970
+var endDate = new Date(2500, 0, 1);  // Default to Jan 1, 2500
+
+// Date format to use in the spreadsheet.
 var dateFormat = 'M/d/yyyy H:mm';
 
 var titleRowMap = {
@@ -18,14 +22,24 @@ var titleRowMap = {
   'starttime': 'Start Time',
   'endtime': 'End Time',
   'guests': 'Guests',
+  'color': 'Color',
   'id': 'Id'
 };
-var titleRowKeys = ['title', 'description', 'location', 'starttime', 'endtime', 'guests', 'id'];
+var titleRowKeys = ['title', 'description', 'location', 'starttime', 'endtime', 'guests', 'color', 'id'];
 var requiredFields = ['id', 'title', 'starttime', 'endtime'];
 
 // This controls whether email invites are sent to guests when the event is created in the
 // calendar. Note that any changes to the event will cause email invites to be resent.
 var SEND_EMAIL_INVITES = false;
+
+// Setting this to true will silently skip rows that have a blank start and end time
+// instead of popping up an error dialog.
+var SKIP_BLANK_ROWS = false;
+
+// Updating too many events in a short time period triggers an error. These values
+// were tested for updating 40 events. Modify these values if you're still seeing errors.
+var THROTTLE_THRESHOLD = 10;
+var THROTTLE_SLEEP_TIME = 75;
 
 // Adds the custom menu to the active spreadsheet.
 function onOpen() {
@@ -62,13 +76,17 @@ function createIdxMap(row) {
 }
 
 // Converts a spreadsheet row into an object containing event-related fields
-function reformatEvent(row, idxMap) {
-  return row.reduce(function(event, value, idx) {
+function reformatEvent(row, idxMap, keysToAdd) {
+  var reformatted = row.reduce(function(event, value, idx) {
     if (idxMap[idx] != null) {
       event[idxMap[idx]] = value;
     }
     return event;
   }, {});
+  for (var k in keysToAdd) {
+    reformatted[keysToAdd[k]] = '';
+  }
+  return reformatted;
 }
 
 // Converts a calendar event to a psuedo-sheet event.
@@ -78,7 +96,8 @@ function convertCalEvent(calEvent) {
     'title': calEvent.getTitle(),
     'description': calEvent.getDescription(),
     'location': calEvent.getLocation(),
-    'guests': calEvent.getGuestList().map(function(x) {return x.getEmail();}).join(',')
+    'guests': calEvent.getGuestList().map(function(x) {return x.getEmail();}).join(','),
+    'color': calEvent.getColor()
   };
   if (calEvent.isAllDayEvent()) {
     convertedEvent.starttime = calEvent.getAllDayStartDate();
@@ -122,12 +141,20 @@ function eventMatches(cev, sev) {
     convertedCalEvent.location == sev.location &&
     convertedCalEvent.starttime.toString() == sev.starttime.toString() &&
     getEndTime(convertedCalEvent) === getEndTime(sev) &&
-    convertedCalEvent.guests == sev.guests;
+    convertedCalEvent.guests == sev.guests &&
+    convertedCalEvent.color == ('' + sev.color);
 }
 
 // Determine whether required fields are missing
-function fieldsMissing(idxMap) {
+function areRequiredFieldsMissing(idxMap) {
   return requiredFields.some(function(val) {
+    return idxMap.indexOf(val) < 0;
+  });
+}
+
+// Returns list of fields that aren't in spreadsheet
+function missingFields(idxMap) {
+  return titleRowKeys.filter(function(val) {
     return idxMap.indexOf(val) < 0;
   });
 }
@@ -149,6 +176,7 @@ function errorAlert(msg, evt, ridx) {
   }
 }
 
+// Updates a calendar event from a sheet event.
 function updateEvent(calEvent, sheetEvent){
   sheetEvent.sendInvites = SEND_EMAIL_INVITES;
   if (sheetEvent.endtime === '') {
@@ -159,16 +187,21 @@ function updateEvent(calEvent, sheetEvent){
   calEvent.setTitle(sheetEvent.title);
   calEvent.setDescription(sheetEvent.description);
   calEvent.setLocation(sheetEvent.location);
+  // Set event color
+  if (sheetEvent.color > 0 && sheetEvent.color < 12) {
+    calEvent.setColor('' + sheetEvent.color);
+  }
   var guestCal = calEvent.getGuestList().map(function (x) {
     return {
       email: x.getEmail(),
       added: false
     };
   });
-  var guests = sheetEvent.guests.split(',').map(function (x) {
+  var sheetGuests = sheetEvent.guests || '';
+  var guests = sheetGuests.split(',').map(function (x) {
     return x ? x.trim() : '';
   });
-  //check guests that are already invited
+  // Check guests that are already invited.
   for (var gIx = 0; gIx < guestCal.length; gIx++) {
     var index = guests.indexOf(guestCal[gIx].email);
     if (index >= 0) {
@@ -190,7 +223,7 @@ function updateEvent(calEvent, sheetEvent){
 function syncFromCalendar() {
   // Get calendar and events
   var calendar = CalendarApp.getCalendarById(calendarId);
-  var calEvents = calendar.getEvents(new Date('1/1/' + (years && years.length ? years[0] : '1970')), new Date('31/12/' + (years && years.length  ? years[years.length - 1] : '2030')));
+  var calEvents = calendar.getEvents(beginDate, endDate);
 
   // Get spreadsheet and data
   var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
@@ -223,7 +256,7 @@ function syncFromCalendar() {
   var idIdx = idxMap.indexOf('id');
 
   // Verify header has all required fields
-  if (fieldsMissing(idxMap)) {
+  if (areRequiredFieldsMissing(idxMap)) {
     var reqFieldNames = requiredFields.map(function(x) {return titleRowMap[x];}).join(', ');
     errorAlert('Spreadsheet must have ' + reqFieldNames + ' columns');
     return;
@@ -277,7 +310,7 @@ function syncToCalendar() {
   if (!calendar) {
     errorAlert('Cannot find calendar. Check instructions for set up.');
   }
-  var calEvents = calendar.getEvents(new Date('1/1/' + (years && years.length  ? years[0] : '1970')), new Date('31/12/' + (years && years.length  ? years[years.length - 1] : '2030')));
+  var calEvents = calendar.getEvents(beginDate, endDate);
   var calEventIds = calEvents.map(function(val) {return val.getId();});
 
   // Get spreadsheet and data
@@ -297,18 +330,26 @@ function syncToCalendar() {
   var idData = idRange.getValues()
 
   // Verify header has all required fields
-  if (fieldsMissing(idxMap)) {
+  if (areRequiredFieldsMissing(idxMap)) {
     var reqFieldNames = requiredFields.map(function(x) {return titleRowMap[x];}).join(', ');
     errorAlert('Spreadsheet must have ' + reqFieldNames + ' columns');
     return;
   }
 
+  var keysToAdd = missingFields(idxMap);
+
   // Loop through spreadsheet rows
-  var numAdds = 0;
+  var numChanges = 0;
   var numUpdated = 0;
   var changesMade = false;
   for (var ridx = 1; ridx < data.length; ridx++) {
-    var sheetEvent = reformatEvent(data[ridx], idxMap);
+    var sheetEvent = reformatEvent(data[ridx], idxMap, keysToAdd);
+
+    // If enabled, skip rows with blank/invalid start and end times
+    if (SKIP_BLANK_ROWS && !(sheetEvent.starttime instanceof Date) &&
+        !(sheetEvent.endtime instanceof Date)) {
+      continue;
+    }
 
     // Do some error checking first
     if (!sheetEvent.title) {
@@ -330,16 +371,38 @@ function syncToCalendar() {
       }
     }
 
+    // Ignore events outside of the begin/end range desired.
+    if (sheetEvent.starttime > endDate) {
+      continue;
+    }
+    if (sheetEvent.endtime === '') {
+      if (sheetEvent.starttime < beginDate) {
+        continue;
+      }
+    } else {
+      if (sheetEvent.endtime < beginDate) {
+        continue;
+      }
+    }
+
     // Determine if spreadsheet event is already in calendar and matches
     var addEvent = true;
     if (sheetEvent.id) {
       var eventIdx = calEventIds.indexOf(sheetEvent.id);
       if (eventIdx >= 0) {
         calEventIds[eventIdx] = null;  // Prevents removing event below
+        addEvent = false;
         var calEvent = calEvents[eventIdx];
         if (!eventMatches(calEvent, sheetEvent)) {
-          //update the event
+          // Update the event
           updateEvent(calEvent, sheetEvent);
+
+          // Maybe throttle updates.
+          numChanges++;
+          if (numChanges > THROTTLE_THRESHOLD) {
+            Utilities.sleep(THROTTLE_SLEEP_TIME);
+          }
+        }
       }
     }
     if (addEvent) {
@@ -354,11 +417,15 @@ function syncToCalendar() {
       idData[ridx][0] = newEvent.getId();
       changesMade = true;
 
-      // Updating too many calendar events in a short time interval triggers an error. Still experimenting with
-      // the exact values to use here, but this works for updating about 40 events.
-      numAdds++;
-      if (numAdds > 10) {
-        Utilities.sleep(75);
+      // Set event color
+      if (sheetEvent.color > 0 && sheetEvent.color < 12) {
+        newEvent.setColor('' + sheetEvent.color);
+      }
+
+      // Maybe throttle updates.
+      numChanges++;
+      if (numChanges > THROTTLE_THRESHOLD) {
+        Utilities.sleep(THROTTLE_SLEEP_TIME);
       }
     }
   }
@@ -391,5 +458,26 @@ function syncToCalendar() {
       });
     }
   }
+  Logger.log('Updated %s calendar events', numChanges);
 }
+
+// Set up a trigger to automatically update the calendar when the spreadsheet is
+// modified. See the instructions for how to use this.
+function createSpreadsheetEditTrigger() {
+  var ss = SpreadsheetApp.getActive();
+  ScriptApp.newTrigger('syncToCalendar')
+      .forSpreadsheet(ss)
+      .onEdit()
+      .create();
+}
+
+// Delete the trigger. Use this to stop automatically updating the calendar.
+function deleteTrigger() {
+  // Loop over all triggers.
+  var allTriggers = ScriptApp.getProjectTriggers();
+  for (var idx = 0; idx < allTriggers.length; idx++) {
+    if (allTriggers[idx].getHandlerFunction() === 'syncToCalendar') {
+      ScriptApp.deleteTrigger(allTriggers[idx]);
+    }
+  }
 }
